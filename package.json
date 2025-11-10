@@ -1,0 +1,17 @@
+{
+  "name": "domain-checker-api",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "express": "^5.1.0",
+    "psl": "^1.15.0",
+    "whoiser": "^2.0.0-beta.9"
+  }
+}
