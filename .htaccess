@@ -1,0 +1,12 @@
+# สำหรับ Apache/XAMPP - Proxy requests to Node.js
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    
+    # Proxy to Node.js running on port 3000
+    RewriteRule ^webhook-test/(.*)$ http://localhost:3000/webhook-test/$1 [P,L]
+    RewriteRule ^api/(.*)$ http://localhost:3000/api/$1 [P,L]
+    
+    # Health check
+    RewriteRule ^$ http://localhost:3000/ [P,L]
+</IfModule>
+

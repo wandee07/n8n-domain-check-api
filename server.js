@@ -3,24 +3,25 @@ const express = require('express');
 const mysql = require('mysql2/promise');
 const psl = require('psl');
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // Database connection pool
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
     port: parseInt(process.env.DB_PORT || '3306'),
     user: process.env.DB_USERNAME,
-    password: process.env.DB_PASSWORD?.replace(/^"|"$/g, ''), // Remove quotes if present
+    password: process.env.DB_PASSWORD?.replace(/^"|"$/g, ''),
     database: process.env.DB_DATABASE,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
 
-// Middleware เพื่อเปิด CORS (หากจำเป็นสำหรับการทดสอบ)
+// Middleware เพื่อเปิด CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     next();
 });
 
@@ -37,7 +38,6 @@ const normalizeDomain = (input) => {
         return null;
     }
 
-    // Remove protocol if provided
     if (value.startsWith('http://') || value.startsWith('https://')) {
         try {
             const url = new URL(value);
@@ -47,13 +47,12 @@ const normalizeDomain = (input) => {
         }
     }
 
-    // Remove path/query/hash if still present
     value = value.split('/')[0];
     value = value.split('?')[0];
     value = value.split('#')[0];
 
     value = value.toLowerCase();
-    value = value.replace(/\.$/, ''); // remove trailing dot
+    value = value.replace(/\.$/, '');
 
     if (!/^[a-z0-9.-]+$/.test(value) || !value.includes('.')) {
         return null;
@@ -86,7 +85,7 @@ const formatThailandDate = (dateString) => {
 
 const getDomainFromRequest = (req) => {
     if (req.method === 'POST') {
-        return req.body?.domain || req.query?.domain;
+        return req.body?.domain || req.body?.domain_name || req.query?.domain;
     }
     return req.query?.domain;
 };
@@ -95,18 +94,18 @@ const handleDomainCheck = async (req, res) => {
     const requestedDomain = getDomainFromRequest(req);
 
     if (!requestedDomain) {
-        return res.status(400).json({ error: 'กรุณาระบุชื่อโดเมนใน query parameter หรือ request body (เช่น { "domain": "google.com" })' });
+        return res.status(400).json({ 
+            success: false,
+            error: 'กรุณาระบุชื่อโดเมนใน query parameter หรือ request body (เช่น { "domain": "example.com" })' 
+        });
     }
 
     const normalizedDomain = normalizeDomain(requestedDomain);
 
     try {
-        // 2. ดึงข้อมูลจาก Database โดยใช้ domain_nam และ expire_date
-        // ค้นหาตารางที่มีฟิลด์ domain_nam และ expire_date
         let domainData = null;
         
         try {
-            // สร้าง array ของค่าที่จะค้นหา (trim ช่องว่างและลองหลายแบบ)
             const searchValues = [
                 requestedDomain.trim(),
                 requestedDomain.trim().toLowerCase(),
@@ -115,13 +114,10 @@ const handleDomainCheck = async (req, res) => {
             if (normalizedDomain && normalizedDomain !== requestedDomain) {
                 searchValues.push(normalizedDomain);
             }
-            // ลบ duplicate values
             const uniqueSearchValues = [...new Set(searchValues)];
             
-            // ลองค้นหาในตาราง domains ก่อน (เป็นตารางที่ใช้บ่อย)
             const tablesToCheck = ['domains'];
             try {
-                // ดึงรายชื่อตารางทั้งหมดเพื่อหาเพิ่มเติม
                 const [allTables] = await pool.execute('SHOW TABLES');
                 for (const table of allTables) {
                     const tableName = Object.values(table)[0];
@@ -130,18 +126,15 @@ const handleDomainCheck = async (req, res) => {
                     }
                 }
             } catch (err) {
-                // ถ้าไม่สามารถดึงรายชื่อตารางได้ ให้ใช้แค่ domains
+                // Use default tables only
             }
             
             for (const tableName of tablesToCheck) {
                 try {
-                    // ตรวจสอบว่าตารางมีฟิลด์ domain_name และ expire_date หรือไม่
                     const [columns] = await pool.execute(`SHOW COLUMNS FROM \`${tableName}\` LIKE 'domain_name'`);
                     const [expireColumns] = await pool.execute(`SHOW COLUMNS FROM \`${tableName}\` LIKE 'expire_date'`);
                     
                     if (columns.length > 0 && expireColumns.length > 0) {
-                        // Query ด้วยฟิลด์ domain_name และ expire_date
-                        // ใช้ LIKE เพื่อค้นหาแบบไม่สนใจ case sensitivity และ trim ช่องว่าง
                         const placeholders = uniqueSearchValues.map(() => '?').join(',');
                         const [rows] = await pool.execute(
                             `SELECT domain_name, expire_date FROM \`${tableName}\` WHERE TRIM(domain_name) IN (${placeholders}) OR domain_name IN (${placeholders}) LIMIT 1`,
@@ -150,12 +143,10 @@ const handleDomainCheck = async (req, res) => {
                         
                         if (rows && rows.length > 0) {
                             domainData = rows[0];
-                            console.log(`Found domain in table: ${tableName}`, domainData);
                             break;
                         }
                     }
                 } catch (err) {
-                    // ไม่ log error เพื่อลด noise ใน console
                     continue;
                 }
             }
@@ -163,21 +154,17 @@ const handleDomainCheck = async (req, res) => {
             console.error('Error searching tables:', err.message);
         }
 
-        // 3. ดึงข้อมูล Expiration Date จากผลลัพธ์ database
         const expirationDate = domainData?.expire_date;
         
-        // 4. สร้าง Response JSON
         if (expirationDate) {
-            // แปลงเป็น Date object ถ้ายังไม่ใช่
             const expirationDateObj = expirationDate instanceof Date 
                 ? expirationDate 
                 : new Date(expirationDate);
             
-            // ตรวจสอบว่า Date object ถูกต้องหรือไม่
             if (Number.isNaN(expirationDateObj.getTime())) {
                 return res.status(404).json({
                     success: false,
-                    domainName: normalizedDomain,
+                    domainName: normalizedDomain || requestedDomain,
                     error: 'ข้อมูลวันหมดอายุไม่ถูกต้อง'
                 });
             }
@@ -211,13 +198,19 @@ const handleDomainCheck = async (req, res) => {
     }
 };
 
-// Endpoint สำหรับเช็ควันหมดอายุโดเมน
+// Health check endpoint
 app.get('/', (req, res) => {
     res.json({
-        message: 'Domain Checker API is running. Use /api/check?domain=example.com'
+        success: true,
+        message: 'Domain Checker API is running',
+        endpoints: {
+            check: '/api/check?domain=example.com',
+            webhook: '/webhook-test/d9c181cb-b202-49ec-a296-597320ca2afa'
+        }
     });
 });
 
+// API endpoints
 app.get('/api/check', handleDomainCheck);
 app.post('/api/check', handleDomainCheck);
 
@@ -226,7 +219,20 @@ app.post('/webhook-test/d9c181cb-b202-49ec-a296-597320ca2afa', handleDomainCheck
 app.get('/webhook-test/d9c181cb-b202-49ec-a296-597320ca2afa', handleDomainCheck);
 
 // Start Server
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Domain Checker API listening at http://0.0.0.0:${port}`);
+const server = app.listen(port, '0.0.0.0', () => {
+    console.log(`Domain Checker API listening on port ${port}`);
     console.log(`Webhook URL: http://localhost:${port}/webhook-test/d9c181cb-b202-49ec-a296-597320ca2afa`);
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed');
+        pool.end(() => {
+            console.log('Database pool closed');
+            process.exit(0);
+        });
+    });
+});
+
