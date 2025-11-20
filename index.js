@@ -1,8 +1,21 @@
+require('dotenv').config();
 const express = require('express');
-const whoiser = require('whoiser');
+const mysql = require('mysql2/promise');
 const psl = require('psl');
 const app = express();
 const port = 3000;
+
+// Database connection pool
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT || '3306'),
+    user: process.env.DB_USERNAME,
+    password: process.env.DB_PASSWORD?.replace(/^"|"$/g, ''), // Remove quotes if present
+    database: process.env.DB_DATABASE,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
 
 // Middleware เพื่อเปิด CORS (หากจำเป็นสำหรับการทดสอบ)
 app.use((req, res, next) => {
@@ -87,71 +100,113 @@ const handleDomainCheck = async (req, res) => {
 
     const normalizedDomain = normalizeDomain(requestedDomain);
 
-    if (!normalizedDomain) {
-        return res.status(400).json({
-            success: false,
-            domainName: requestedDomain,
-            error: 'รูปแบบโดเมนไม่ถูกต้อง กรุณาระบุชื่อโดเมน เช่น google.com'
-        });
-    }
-
     try {
-        // 2. ใช้ whoiser ดึงข้อมูล WHOIS
-        const whoisData = await whoiser.whoisDomain(normalizedDomain);
+        // 2. ดึงข้อมูลจาก Database โดยใช้ domain_nam และ expire_date
+        // ค้นหาตารางที่มีฟิลด์ domain_nam และ expire_date
+        let domainData = null;
         
-        // 3. ดึงข้อมูล Expiration Date
-        let expirationDate = null;
-
-        // whoiser จะ return object ที่มี key เป็นชื่อ TLD (เช่น .com, .net)
-        // เราต้องวนลูปหรือดึง key แรกออกมา
-        const domainKeys = Object.keys(whoisData);
-        if (domainKeys.length > 0) {
-            const firstTldData = whoisData[domainKeys[0]];
-            
-            // ข้อมูลวันหมดอายุจะอยู่ใน 'Expiry Date' หรือคีย์อื่นที่คล้ายกัน
-            const possibleKeys = [
-                'Expiry Date',
-                'Expiration Date',
-                'Registry Expiry Date',
-                'Registrar Registration Expiration Date'
+        try {
+            // สร้าง array ของค่าที่จะค้นหา (trim ช่องว่างและลองหลายแบบ)
+            const searchValues = [
+                requestedDomain.trim(),
+                requestedDomain.trim().toLowerCase(),
+                requestedDomain.trim().toUpperCase()
             ];
-
-            expirationDate = possibleKeys
-                .map((key) => firstTldData[key])
-                .find((value) => Boolean(value));
-            
-            // ถ้ายังไม่เจอ ให้ลองหาใน records ที่อาจจะซ้อนอยู่
-            if (!expirationDate && firstTldData.hasOwnProperty('text')) {
-                // สำหรับโดเมน .th หรือโดเมนที่ซับซ้อน อาจจะต้อง parse จาก text เอง
-                // แต่โดยปกติ whoiser จะดึงมาให้แล้ว
+            if (normalizedDomain && normalizedDomain !== requestedDomain) {
+                searchValues.push(normalizedDomain);
             }
+            // ลบ duplicate values
+            const uniqueSearchValues = [...new Set(searchValues)];
+            
+            // ลองค้นหาในตาราง domains ก่อน (เป็นตารางที่ใช้บ่อย)
+            const tablesToCheck = ['domains'];
+            try {
+                // ดึงรายชื่อตารางทั้งหมดเพื่อหาเพิ่มเติม
+                const [allTables] = await pool.execute('SHOW TABLES');
+                for (const table of allTables) {
+                    const tableName = Object.values(table)[0];
+                    if (!tablesToCheck.includes(tableName)) {
+                        tablesToCheck.push(tableName);
+                    }
+                }
+            } catch (err) {
+                // ถ้าไม่สามารถดึงรายชื่อตารางได้ ให้ใช้แค่ domains
+            }
+            
+            for (const tableName of tablesToCheck) {
+                try {
+                    // ตรวจสอบว่าตารางมีฟิลด์ domain_name และ expire_date หรือไม่
+                    const [columns] = await pool.execute(`SHOW COLUMNS FROM \`${tableName}\` LIKE 'domain_name'`);
+                    const [expireColumns] = await pool.execute(`SHOW COLUMNS FROM \`${tableName}\` LIKE 'expire_date'`);
+                    
+                    if (columns.length > 0 && expireColumns.length > 0) {
+                        // Query ด้วยฟิลด์ domain_name และ expire_date
+                        // ใช้ LIKE เพื่อค้นหาแบบไม่สนใจ case sensitivity และ trim ช่องว่าง
+                        const placeholders = uniqueSearchValues.map(() => '?').join(',');
+                        const [rows] = await pool.execute(
+                            `SELECT domain_name, expire_date FROM \`${tableName}\` WHERE TRIM(domain_name) IN (${placeholders}) OR domain_name IN (${placeholders}) LIMIT 1`,
+                            [...uniqueSearchValues.map(v => v.trim()), ...uniqueSearchValues]
+                        );
+                        
+                        if (rows && rows.length > 0) {
+                            domainData = rows[0];
+                            console.log(`Found domain in table: ${tableName}`, domainData);
+                            break;
+                        }
+                    }
+                } catch (err) {
+                    // ไม่ log error เพื่อลด noise ใน console
+                    continue;
+                }
+            }
+        } catch (err) {
+            console.error('Error searching tables:', err.message);
         }
+
+        // 3. ดึงข้อมูล Expiration Date จากผลลัพธ์ database
+        const expirationDate = domainData?.expire_date;
         
         // 4. สร้าง Response JSON
         if (expirationDate) {
-            const expirationDateThai = formatThailandDate(expirationDate);
+            // แปลงเป็น Date object ถ้ายังไม่ใช่
+            const expirationDateObj = expirationDate instanceof Date 
+                ? expirationDate 
+                : new Date(expirationDate);
+            
+            // ตรวจสอบว่า Date object ถูกต้องหรือไม่
+            if (Number.isNaN(expirationDateObj.getTime())) {
+                return res.status(404).json({
+                    success: false,
+                    domainName: normalizedDomain,
+                    error: 'ข้อมูลวันหมดอายุไม่ถูกต้อง'
+                });
+            }
+            
+            const expirationDateString = expirationDateObj.toISOString().split('T')[0];
+            const expirationDateThai = formatThailandDate(expirationDateObj);
+            const domainName = domainData.domain_name || normalizedDomain || requestedDomain;
 
             return res.json({
                 success: true,
-                domainName: normalizedDomain,
-                expirationDate: expirationDate, // วันที่ในรูปแบบ string ที่ n8n อ่านได้
-                expirationDateThai: expirationDateThai || expirationDate,
-                message: `วันหมดอายุของโดเมน ${normalizedDomain} คือ ${expirationDateThai || expirationDate}`
+                domainName: domainName,
+                expirationDate: expirationDateString,
+                expirationDateThai: expirationDateThai || expirationDateString,
+                message: `วันหมดอายุของโดเมน ${domainName} คือ ${expirationDateThai || expirationDateString}`
             });
         } else {
             return res.status(404).json({
                 success: false,
-                domainName: normalizedDomain,
-                error: 'ไม่พบข้อมูลวันหมดอายุสำหรับโดเมนนี้ หรือโดเมนไม่มีอยู่จริง'
+                domainName: normalizedDomain || requestedDomain,
+                error: 'ไม่พบข้อมูลวันหมดอายุสำหรับโดเมนนี้ในฐานข้อมูล'
             });
         }
 
     } catch (error) {
-        console.error('Error fetching WHOIS data:', error);
+        console.error('Error fetching database data:', error);
         return res.status(500).json({
             success: false,
-            domainName: normalizedDomain,
-            error: 'เกิดข้อผิดพลาดในการดึงข้อมูล WHOIS'
+            domainName: normalizedDomain || requestedDomain,
+            error: 'เกิดข้อผิดพลาดในการดึงข้อมูลจากฐานข้อมูล: ' + error.message
         });
     }
 };
