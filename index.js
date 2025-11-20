@@ -85,20 +85,45 @@ const formatThailandDate = (dateString) => {
 };
 
 const getDomainFromRequest = (req) => {
+    // n8n อาจส่งข้อมูลมาในรูปแบบต่างๆ
     if (req.method === 'POST') {
-        return req.body?.domain || req.query?.domain;
+        // ลองหาจากหลายที่ (n8n อาจส่งมาในรูปแบบ nested object)
+        return req.body?.domain || 
+               req.body?.domain_name ||
+               req.body?.json?.domain ||
+               req.body?.json?.domain_name ||
+               req.body?.body?.domain ||
+               req.body?.data?.domain ||
+               req.query?.domain ||
+               req.query?.domain_name;
     }
-    return req.query?.domain;
+    return req.query?.domain || req.query?.domain_name;
 };
 
 const handleDomainCheck = async (req, res) => {
+    // Log incoming request for debugging
+    console.log('=== Incoming Request ===');
+    console.log('Method:', req.method);
+    console.log('URL:', req.url);
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+    console.log('Query:', req.query);
+    
     const requestedDomain = getDomainFromRequest(req);
+    console.log('Extracted domain:', requestedDomain);
 
     if (!requestedDomain) {
-        return res.status(400).json({ error: 'กรุณาระบุชื่อโดเมนใน query parameter หรือ request body (เช่น { "domain": "google.com" })' });
+        return res.status(400).json({ 
+            success: false,
+            error: 'กรุณาระบุชื่อโดเมนใน query parameter หรือ request body (เช่น { "domain": "google.com" })',
+            receivedData: {
+                body: req.body,
+                query: req.query
+            }
+        });
     }
 
     const normalizedDomain = normalizeDomain(requestedDomain);
+    console.log('Normalized domain:', normalizedDomain);
 
     try {
         // 2. ดึงข้อมูลจาก Database โดยใช้ domain_nam และ expire_date
@@ -150,8 +175,10 @@ const handleDomainCheck = async (req, res) => {
                         
                         if (rows && rows.length > 0) {
                             domainData = rows[0];
-                            console.log(`Found domain in table: ${tableName}`, domainData);
+                            console.log(`✓ Found domain in table: ${tableName}`, domainData);
                             break;
+                        } else {
+                            console.log(`✗ No match in table: ${tableName} for: ${requestedDomain}`);
                         }
                     }
                 } catch (err) {
@@ -194,10 +221,13 @@ const handleDomainCheck = async (req, res) => {
                 message: `วันหมดอายุของโดเมน ${domainName} คือ ${expirationDateThai || expirationDateString}`
             });
         } else {
+            console.log(`✗ Domain not found: ${requestedDomain}`);
             return res.status(404).json({
                 success: false,
                 domainName: normalizedDomain || requestedDomain,
-                error: 'ไม่พบข้อมูลวันหมดอายุสำหรับโดเมนนี้ในฐานข้อมูล'
+                error: 'ไม่พบข้อมูลวันหมดอายุสำหรับโดเมนนี้ในฐานข้อมูล',
+                searchedFor: requestedDomain,
+                normalizedTo: normalizedDomain
             });
         }
 
